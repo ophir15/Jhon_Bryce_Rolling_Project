@@ -1,0 +1,189 @@
+# Configure the AWS Provider
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
+    }
+    local = {
+      source  = "hashicorp/local"
+      version = "~> 2.0"
+    }
+  }
+}
+
+provider "aws" {
+  region     = var.aws_region
+  access_key = "AKIAXLEKZJVVQJ3EPVUU"
+  secret_key = "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"
+}
+
+# Data source to get the latest Amazon Linux 2 AMI
+data "aws_ami" "amazon_linux" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+# Use existing VPC and subnet
+data "aws_vpc" "existing" {
+  id = var.vpc_id
+}
+
+data "aws_subnet" "existing" {
+  id = var.subnet_id
+}
+
+# Create security group for builder instance
+resource "aws_security_group" "builder_sg" {
+  name_prefix = "builder-sg"
+  vpc_id      = data.aws_vpc.existing.id
+
+  # SSH access (port 22) - restricted to specific IP range
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.allowed_ssh_cidr]
+    description = "SSH access"
+  }
+
+  # HTTP access (port 5001) for Python application - restricted to specific IP range
+  ingress {
+    from_port   = 5001
+    to_port     = 5001
+    protocol    = "tcp"
+    cidr_blocks = [var.allowed_http_cidr]
+    description = "HTTP access for Python application"
+  }
+
+  # All outbound traffic for software downloads and updates
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "All outbound traffic"
+  }
+
+  tags = {
+    Name = "builder-security-group"
+  }
+}
+
+# Generate an SSH key pair
+resource "tls_private_key" "ssh_key" {
+  algorithm = "RSA"
+  rsa_bits  = 4096
+}
+
+# Save the private key locally
+resource "local_file" "private_key" {
+  content         = tls_private_key.ssh_key.private_key_pem
+  filename        = "${path.module}/builder_key.pem"
+  file_permission = "0600"
+}
+
+# Save SSH key information as a text file
+resource "local_file" "ssh_key_info" {
+  content = <<-EOT
+SSH Key Information
+==================
+
+Private Key File: ${local_file.private_key.filename}
+Public Key: ${tls_private_key.ssh_key.public_key_openssh}
+AWS Key Pair Name: ${aws_key_pair.builder_key.key_name}
+
+Connection Information:
+- Instance Public IP: ${aws_instance.builder.public_ip}
+- Instance Public DNS: ${aws_instance.builder.public_dns}
+- SSH Command: ssh -i ${local_file.private_key.filename} ec2-user@${aws_instance.builder.public_ip}
+
+Security Notes:
+- Private key file permissions set to 0600 (readable only by owner)
+- Keep the private key secure and do not share it
+- The public key has been uploaded to AWS as key pair: ${aws_key_pair.builder_key.key_name}
+EOT
+  filename        = "${path.module}/ssh_key_info.txt"
+  file_permission = "0644"
+}
+
+# Create an AWS key pair using the public key
+resource "aws_key_pair" "builder_key" {
+  key_name   = "builder-key"
+  public_key = tls_private_key.ssh_key.public_key_openssh
+}
+
+# Create EC2 instance
+resource "aws_instance" "builder" {
+  ami                    = data.aws_ami.amazon_linux.id
+  instance_type          = var.instance_type
+  key_name              = aws_key_pair.builder_key.key_name
+  vpc_security_group_ids = [aws_security_group.builder_sg.id]
+  subnet_id             = data.aws_subnet.existing.id
+
+  # User data script for basic setup
+  user_data = <<-EOF
+    #!/bin/bash
+    yum update -y
+  EOF
+
+  tags = {
+    Name = "builder"
+  }
+}
+
+# Output values
+output "instance_id" {
+  description = "ID of the EC2 instance"
+  value       = aws_instance.builder.id
+}
+
+output "instance_public_ip" {
+  description = "Public IP address of the EC2 instance"
+  value       = aws_instance.builder.public_ip
+}
+
+output "instance_public_dns" {
+  description = "Public DNS name of the EC2 instance"
+  value       = aws_instance.builder.public_dns
+}
+
+output "security_group_id" {
+  description = "ID of the security group"
+  value       = aws_security_group.builder_sg.id
+}
+
+output "ssh_private_key_path" {
+  value       = local_file.private_key.filename
+  description = "Path to the generated private SSH key"
+  sensitive   = true
+}
+
+output "ssh_key_name" {
+  value       = aws_key_pair.builder_key.key_name
+  description = "Name of the AWS SSH key pair"
+}
+
+output "ssh_connection" {
+  description = "SSH connection command"
+  value       = "ssh -i ${local_file.private_key.filename} ec2-user@${aws_instance.builder.public_ip}"
+}
+
+output "ssh_key_info_file" {
+  description = "Path to the SSH key information text file"
+  value       = local_file.ssh_key_info.filename
+}
