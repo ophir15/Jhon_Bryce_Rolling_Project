@@ -11,15 +11,13 @@ terraform {
     }
     local = {
       source  = "hashicorp/local"
-      version = "~> 2.0"
+      version = ">= 2.4.0"
     }
   }
 }
 
 provider "aws" {
   region     = var.aws_region
-  access_key = "AKIAXLEKZJVVQJ3EPVUU"
-  secret_key = "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"
 }
 
 # Data source to get the latest Amazon Linux 2 AMI
@@ -41,10 +39,6 @@ data "aws_ami" "amazon_linux" {
 # Use existing VPC and subnet
 data "aws_vpc" "existing" {
   id = var.vpc_id
-}
-
-data "aws_subnet" "existing" {
-  id = var.subnet_id
 }
 
 # Create security group for builder instance
@@ -91,9 +85,9 @@ resource "tls_private_key" "ssh_key" {
 }
 
 # Save the private key locally
-resource "local_file" "private_key" {
-  content         = tls_private_key.ssh_key.private_key_pem
+resource "local_sensitive_file" "private_key" {
   filename        = "${path.module}/builder_key.pem"
+  content         = tls_private_key.ssh_key.private_key_pem
   file_permission = "0600"
 }
 
@@ -103,14 +97,14 @@ resource "local_file" "ssh_key_info" {
 SSH Key Information
 ==================
 
-Private Key File: ${local_file.private_key.filename}
+Private Key File: ${local_sensitive_file.private_key.filename}
 Public Key: ${tls_private_key.ssh_key.public_key_openssh}
 AWS Key Pair Name: ${aws_key_pair.builder_key.key_name}
 
 Connection Information:
 - Instance Public IP: ${aws_instance.builder.public_ip}
 - Instance Public DNS: ${aws_instance.builder.public_dns}
-- SSH Command: ssh -i ${local_file.private_key.filename} ec2-user@${aws_instance.builder.public_ip}
+- SSH Command: ssh -i ${local_sensitive_file.private_key.filename} ec2-user@${aws_instance.builder.public_ip}
 
 Security Notes:
 - Private key file permissions set to 0600 (readable only by owner)
@@ -123,8 +117,29 @@ EOT
 
 # Create an AWS key pair using the public key
 resource "aws_key_pair" "builder_key" {
-  key_name   = "builder-key"
+  key_name   = var.key_name
   public_key = tls_private_key.ssh_key.public_key_openssh
+}
+
+data "aws_subnets" "available" {
+  filter {
+    name   = "vpc-id"
+    values = [var.vpc_id]
+  }
+
+  dynamic "filter" {
+    for_each = var.subnet_tag_filters
+    content {
+      name   = "tag:${filter.key}"
+      values = [filter.value]
+    }
+  }
+}
+
+locals {
+  single_subnet      = var.subnet_id != null ? [var.subnet_id] : []
+  candidate_subnets  = length(var.subnet_ids) > 0 ? var.subnet_ids : (length(local.single_subnet) > 0 ? local.single_subnet : data.aws_subnets.available.ids)
+  selected_subnet_id = try(element(local.candidate_subnets, var.subnet_index), null)
 }
 
 # Create EC2 instance
@@ -133,7 +148,7 @@ resource "aws_instance" "builder" {
   instance_type          = var.instance_type
   key_name              = aws_key_pair.builder_key.key_name
   vpc_security_group_ids = [aws_security_group.builder_sg.id]
-  subnet_id             = data.aws_subnet.existing.id
+  subnet_id             = local.selected_subnet_id
 
   # User data script for basic setup
   user_data = <<-EOF
@@ -143,6 +158,22 @@ resource "aws_instance" "builder" {
 
   tags = {
     Name = "builder"
+  }
+
+  metadata_options {
+    http_endpoint = "enabled"
+    http_tokens   = "required"
+  }
+
+  root_block_device {
+    encrypted = true
+  }
+
+  lifecycle {
+    precondition {
+      condition     = local.selected_subnet_id != null && length(local.candidate_subnets) > var.subnet_index
+      error_message = "subnet_index ${var.subnet_index} is out of range for the resolved subnet list (size ${length(local.candidate_subnets)})."
+    }
   }
 }
 
@@ -168,7 +199,7 @@ output "security_group_id" {
 }
 
 output "ssh_private_key_path" {
-  value       = local_file.private_key.filename
+  value       = local_sensitive_file.private_key.filename
   description = "Path to the generated private SSH key"
   sensitive   = true
 }
@@ -180,7 +211,7 @@ output "ssh_key_name" {
 
 output "ssh_connection" {
   description = "SSH connection command"
-  value       = "ssh -i ${local_file.private_key.filename} ec2-user@${aws_instance.builder.public_ip}"
+  value       = "ssh -i ${local_sensitive_file.private_key.filename} ec2-user@${aws_instance.builder.public_ip}"
 }
 
 output "ssh_key_info_file" {

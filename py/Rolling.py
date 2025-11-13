@@ -1,11 +1,18 @@
+import logging
 import os
+from typing import Iterable, List, Sequence
+
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
-from flask import Flask, render_template_string, abort
+from flask import Flask, abort, render_template_string
+from werkzeug.wrappers import Response
 
 app = Flask(__name__)
 
-# Default to us-east-2 (your region), allow override via env
+logging.basicConfig(level=os.getenv("ROLLING_LOG_LEVEL", "INFO"))
+logger = logging.getLogger(__name__)
+
+# Default to us-east-1 (developer can override with AWS_REGION / AWS_DEFAULT_REGION)
 REGION = os.getenv("AWS_REGION", os.getenv("AWS_DEFAULT_REGION", "us-east-1"))
 
 # Use the default AWS credential chain (env vars, ~/.aws/credentials, IAM role, etc.)
@@ -59,64 +66,127 @@ echo $env:AWS_DEFAULT_REGION</code></pre>
 </html>
 """
 
+def _paginate(
+    client,
+    operation: str,
+    result_keys: Sequence[str],
+    *,
+    pagination_kwargs: dict | None = None,
+    operation_kwargs: dict | None = None,
+) -> Iterable[dict]:
+    paginator = client.get_paginator(operation)
+    for page in paginator.paginate(**(operation_kwargs or {}), **(pagination_kwargs or {})):
+        data = page
+        for key in result_keys:
+            data = data.get(key, [])
+        if isinstance(data, list):
+            yield from data
+        else:
+            logger.debug("Unexpected paginator data shape for %s -> %s", operation, result_keys)
+
+
+def _collect_instances() -> List[dict]:
+    items: List[dict] = []
+    try:
+        for reservation in _paginate(
+            ec2_client,
+            "describe_instances",
+            result_keys=("Reservations",),
+            operation_kwargs={
+                "Filters": [{"Name": "instance-state-name", "Values": ["running"]}],
+            },
+        ):
+            for instance in reservation.get("Instances", []):
+                items.append(
+                    {
+                        "ID": instance.get("InstanceId", "N/A"),
+                        "State": instance.get("State", {}).get("Name", "unknown"),
+                        "Type": instance.get("InstanceType", "unknown"),
+                        "Public IP": instance.get("PublicIpAddress", "N/A"),
+                    }
+                )
+    except (BotoCoreError, ClientError) as exc:
+        logger.exception("Failed to collect EC2 instances")
+        raise exc
+    return items
+
+
+def _collect_vpcs() -> List[dict]:
+    try:
+        vpcs_resp = ec2_client.describe_vpcs()
+    except (BotoCoreError, ClientError) as exc:
+        logger.exception("Failed to collect VPCs")
+        raise exc
+
+    return [
+        {"VPC ID": vpc.get("VpcId", "N/A"), "CIDR": vpc.get("CidrBlock", "N/A")}
+        for vpc in vpcs_resp.get("Vpcs", [])
+    ]
+
+
+def _collect_load_balancers() -> List[dict]:
+    items: List[dict] = []
+    try:
+        for load_balancer in _paginate(elb_client, "describe_load_balancers", result_keys=("LoadBalancers",)):
+            items.append(
+                {
+                    "LB Name": load_balancer.get("LoadBalancerName", "N/A"),
+                    "DNS Name": load_balancer.get("DNSName", "N/A"),
+                }
+            )
+    except (BotoCoreError, ClientError) as exc:
+        logger.exception("Failed to collect load balancers")
+        raise exc
+    return items
+
+
+def _collect_amis() -> List[dict]:
+    items: List[dict] = []
+    try:
+        for image in _paginate(
+            ec2_client,
+            "describe_images",
+            result_keys=("Images",),
+            operation_kwargs={"Owners": ["self"]},
+        ):
+            items.append({"AMI ID": image.get("ImageId", "N/A"), "Name": image.get("Name", "N/A")})
+    except (BotoCoreError, ClientError) as exc:
+        logger.exception("Failed to collect AMIs")
+        raise exc
+    return items
+
+
+def _fetch_identity() -> tuple[str, str]:
+    whoami = sts_client.get_caller_identity()
+    return whoami.get("Account", "unknown"), whoami.get("Arn", "unknown")
+
+
+@app.after_request
+def add_security_headers(response: Response) -> Response:
+    response.headers.setdefault("Content-Security-Policy", "default-src 'self'")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Permissions-Policy", "geolocation=()")
+    return response
+
+
 @app.route("/")
 def home():
     # Verify credentials first
     try:
-        whoami = sts_client.get_caller_identity()  # raises if no/invalid creds
-        account = whoami.get("Account", "unknown")
-        arn = whoami.get("Arn", "unknown")
+        account, arn = _fetch_identity()
     except (NoCredentialsError, ClientError, BotoCoreError):
         # Show inline PowerShell instructions
         return SETUP_HTML, 200
 
     try:
-        # --- EC2 Instances (running only) ---
-        instances = []
-        resp = ec2_client.describe_instances(
-            Filters=[{"Name": "instance-state-name", "Values": ["running"]}]
-        )
-        reservations = resp.get("Reservations", [])
-        while True:
-            for r in reservations:
-                for i in r.get("Instances", []):
-                    instances.append({
-                        "ID": i.get("InstanceId", "N/A"),
-                        "State": i.get("State", {}).get("Name", "unknown"),
-                        "Type": i.get("InstanceType", "unknown"),
-                        "Public IP": i.get("PublicIpAddress", "N/A"),
-                    })
-            token = resp.get("NextToken")
-            if not token:
-                break
-            resp = ec2_client.describe_instances(NextToken=token)
-            reservations = resp.get("Reservations", [])
-
-        # --- VPCs ---
-        vpcs_resp = ec2_client.describe_vpcs()
-        vpc_data = [{"VPC ID": v.get("VpcId", "N/A"), "CIDR": v.get("CidrBlock", "N/A")}
-                    for v in vpcs_resp.get("Vpcs", [])]
-
-        # --- Load Balancers (ALB/NLB via elbv2) ---
-        lbs = []
-        lb_resp = elb_client.describe_load_balancers()
-        lbs.extend(lb_resp.get("LoadBalancers", []))
-        marker = lb_resp.get("NextMarker")
-        while marker:
-            lb_resp = elb_client.describe_load_balancers(Marker=marker)
-            lbs.extend(lb_resp.get("LoadBalancers", []))
-            marker = lb_resp.get("NextMarker")
-        lb_data = [{"LB Name": lb.get("LoadBalancerName", "N/A"),
-                    "DNS Name": lb.get("DNSName", "N/A")} for lb in lbs]
-
-        # --- AMIs you own ---
-        amis_resp = ec2_client.describe_images(Owners=["self"])
-        ami_data = [{"AMI ID": a.get("ImageId", "N/A"), "Name": a.get("Name", "N/A")}
-                    for a in amis_resp.get("Images", [])]
-
-    except (BotoCoreError, ClientError) as e:
-        msg = getattr(e, "response", {}).get("Error", {}).get("Message", str(e))
-        abort(500, description=f"AWS API error: {msg}")
+        instances = _collect_instances()
+        vpc_data = _collect_vpcs()
+        lb_data = _collect_load_balancers()
+        ami_data = _collect_amis()
+    except (BotoCoreError, ClientError):
+        abort(502, description="Failed to query AWS APIs. Please try again later.")
 
     html = """
     <html>
