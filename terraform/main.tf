@@ -160,6 +160,32 @@ resource "aws_instance" "builder" {
     Name = "builder"
   }
 
+  provisioner "remote-exec" {
+    inline = [
+      <<-EOF
+      set -euo pipefail
+      sudo yum update -y
+      sudo amazon-linux-extras install docker -y
+      sudo systemctl enable --now docker
+      sudo usermod -aG docker ec2-user
+      sudo mkdir -p /usr/local/lib/docker/cli-plugins
+      sudo curl -sSL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 -o /usr/local/lib/docker/cli-plugins/docker-compose
+      sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+      sudo systemctl is-active --quiet docker
+      docker --version
+      docker compose version
+      EOF
+    ]
+
+    connection {
+      type        = "ssh"
+      host        = self.public_ip
+      user        = "ec2-user"
+      private_key = tls_private_key.ssh_key.private_key_pem
+      timeout     = "5m"
+    }
+  }
+
   metadata_options {
     http_endpoint = "enabled"
     http_tokens   = "required"

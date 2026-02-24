@@ -21,7 +21,7 @@ variable "vpc_id" {
   type        = string
   nullable    = false
   validation {
-    condition     = length(trim(var.vpc_id)) > 0
+    condition     = length(trimspace(var.vpc_id)) > 0
     error_message = "Provide a valid VPC ID."
   }
 }
