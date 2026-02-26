@@ -70,6 +70,13 @@ pipeline {
        
        stage('Build Docker Image') {
            steps {
+               script {
+                   def hasDocker = sh(script: 'command -v docker >/dev/null 2>&1', returnStatus: true) == 0
+                   if (!hasDocker) {
+                       echo 'Docker CLI not available on this agent. Skipping image build.'
+                       return
+                   }
+               }
                sh '''
                    docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .
                '''
@@ -78,6 +85,13 @@ pipeline {
        
        stage('Push to Docker Hub') {
            steps {
+               script {
+                   def hasDocker = sh(script: 'command -v docker >/dev/null 2>&1', returnStatus: true) == 0
+                   if (!hasDocker) {
+                       echo 'Docker CLI not available on this agent. Skipping Docker Hub push.'
+                       return
+                   }
+               }
                withCredentials([usernamePassword(credentialsId: 'dockerhub-credentials', usernameVariable: 'DOCKERHUB_USERNAME', passwordVariable: 'DOCKERHUB_PASSWORD')]) {
                    sh '''
                        echo "${DOCKERHUB_PASSWORD}" | docker login -u "${DOCKERHUB_USERNAME}" --password-stdin
