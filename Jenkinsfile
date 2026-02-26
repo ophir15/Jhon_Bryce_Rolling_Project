@@ -83,23 +83,30 @@ pipeline {
            }
        }
        
-       stage('Push to Docker Hub') {
-           steps {
-               script {
-                   def hasDocker = sh(script: 'command -v docker >/dev/null 2>&1', returnStatus: true) == 0
-                   if (!hasDocker) {
-                       echo 'Docker CLI not available on this agent. Skipping Docker Hub push.'
-                       return
-                   }
-               }
-               withCredentials([usernamePassword(credentialsId: 'dockerhub-credentials', usernameVariable: 'DOCKERHUB_USERNAME', passwordVariable: 'DOCKERHUB_PASSWORD')]) {
-                   sh '''
-                       echo "${DOCKERHUB_PASSWORD}" | docker login -u "${DOCKERHUB_USERNAME}" --password-stdin
-                       docker push ${IMAGE_NAME}:${IMAGE_TAG}
-                   '''
-               }
-           }
-       }
+      stage('Push to Docker Hub') {
+          steps {
+              script {
+                  def hasDocker = sh(script: 'command -v docker >/dev/null 2>&1', returnStatus: true) == 0
+                  if (!hasDocker) {
+                      echo 'Docker CLI not available on this agent. Skipping Docker Hub push.'
+                      return
+                  }
+              }
+              withCredentials([usernamePassword(credentialsId: 'dockerhub-credentials', usernameVariable: 'DOCKERHUB_USERNAME', passwordVariable: 'DOCKERHUB_PASSWORD')]) {
+                  sh '''
+                      set -e
+                      echo "${DOCKERHUB_PASSWORD}" | docker login -u "${DOCKERHUB_USERNAME}" --password-stdin || {
+                        echo "Docker login failed. Check Jenkins credentials and token scopes."
+                        exit 1
+                      }
+                      docker push ${IMAGE_NAME}:${IMAGE_TAG} || {
+                        echo "Docker push failed. Token likely lacks write scope."
+                        exit 1
+                      }
+                  '''
+              }
+          }
+      }
    }
    
    post {
