@@ -1,0 +1,10 @@
+services:
+  app:
+    build:
+      context: .
+    image: ophir15/rolling_project:local
+    ports:
+      - "5001:5001"
+    environment:
+      PORT: "5001"
+    restart: unless-stopped
