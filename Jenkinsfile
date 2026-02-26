@@ -77,9 +77,16 @@ pipeline {
                        return
                    }
                }
-               sh '''
-                   docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .
-               '''
+               withCredentials([usernamePassword(credentialsId: 'dockerhub-credentials', usernameVariable: 'DOCKERHUB_USERNAME', passwordVariable: 'DOCKERHUB_PASSWORD')]) {
+                   sh '''
+                       set -e
+                       echo "${DOCKERHUB_PASSWORD}" | docker login -u "${DOCKERHUB_USERNAME}" --password-stdin || {
+                         echo "Docker login failed. Check Jenkins credentials and token scopes."
+                         exit 1
+                       }
+                       docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .
+                   '''
+               }
            }
        }
        
