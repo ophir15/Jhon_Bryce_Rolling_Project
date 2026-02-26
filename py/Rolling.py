@@ -1,10 +1,11 @@
 import logging
 import os
+import secrets
 from typing import Iterable, List, Sequence
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
-from flask import Flask, abort, render_template_string
+from flask import Flask, abort, render_template_string, request
 from werkzeug.wrappers import Response
 
 app = Flask(__name__)
@@ -14,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 # Default to us-east-1 (developer can override with AWS_REGION / AWS_DEFAULT_REGION)
 REGION = os.getenv("AWS_REGION", os.getenv("AWS_DEFAULT_REGION", "us-east-1"))
+API_KEY = os.getenv("ROLLING_API_KEY")
 
 # Use the default AWS credential chain (env vars, ~/.aws/credentials, IAM role, etc.)
 session = boto3.Session(region_name=REGION)
@@ -171,6 +173,15 @@ def add_security_headers(response: Response) -> Response:
     return response
 
 
+@app.before_request
+def require_api_key() -> None:
+    if not API_KEY:
+        abort(503, description="ROLLING_API_KEY is not set.")
+    provided = request.headers.get("X-API-Key", "")
+    if not secrets.compare_digest(provided, API_KEY):
+        abort(401, description="Unauthorized.")
+
+
 @app.route("/")
 def home():
     # Verify credentials first
@@ -251,5 +262,4 @@ def home():
     )
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5001")),
-            debug=os.getenv("FLASK_DEBUG", "false").lower() == "true")
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5001")), debug=False)

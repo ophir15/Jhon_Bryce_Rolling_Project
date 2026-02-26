@@ -49,7 +49,7 @@ pipeline {
                stage('Security Scanning') {
                    steps {
                        sh '''
-                           set +e
+                           set -e
                            echo "Running security scans..."
                            if command -v bandit >/dev/null 2>&1; then
                              bandit -r py -q
@@ -57,11 +57,10 @@ pipeline {
                              echo "bandit not installed, skipping."
                            fi
                            if command -v trivy >/dev/null 2>&1; then
-                             trivy fs --no-progress --exit-code 0 .
+                             trivy fs --no-progress --exit-code 1 --severity HIGH,CRITICAL .
                            else
                              echo "trivy not installed, skipping."
                            fi
-                           set -e
                        '''
                    }
                }
